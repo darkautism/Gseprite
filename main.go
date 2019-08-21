@@ -16,7 +16,7 @@ import (
 	"unsafe"
 )
 
-func ReadString(file io.Reader) string {
+func readString(file io.Reader) string {
 	var Size uint16
 	if _, err := file.Read((*[2]byte)(unsafe.Pointer(&Size))[:]); err != nil {
 		log.Println(err)
@@ -60,7 +60,7 @@ type Frame struct {
 	Gseprite *Gseprite
 }
 
-func ReadFrame(file io.Reader, g *Gseprite) (*Frame, error) {
+func readFrame(file io.Reader, g *Gseprite) (*Frame, error) {
 	var f Frame
 	f.Gseprite = g
 	file.Read((*[16]byte)(unsafe.Pointer(&f))[:])
@@ -75,7 +75,7 @@ func ReadFrame(file io.Reader, g *Gseprite) (*Frame, error) {
 	}
 
 	for i := 0; i < maxChunk; i++ {
-		f.Chunks = append(f.Chunks, ReadChunk(file, g))
+		f.Chunks = append(f.Chunks, readChunk(file, g))
 	}
 
 	return &f, nil
@@ -143,18 +143,18 @@ func (c chunk) ChunkType() ChunkType {
 	return c.Type
 }
 
-func ReadChunk(file io.Reader, g *Gseprite) Chunk {
+func readChunk(file io.Reader, g *Gseprite) Chunk {
 	var c chunk
 	file.Read((*[6]byte)(unsafe.Pointer(&c))[:])
 	c.Data = make([]byte, c.Size-6)
 	file.Read(c.Data)
 	switch c.Type {
 	case ChunkTypePalette:
-		return ReadPalette(bytes.NewReader(c.Data), g)
+		return readPalette(bytes.NewReader(c.Data), g)
 	case ChunkTypeLayer:
-		return ReadLayer(bytes.NewReader(c.Data), g)
+		return readLayer(bytes.NewReader(c.Data), g)
 	case ChunkTypeCel:
-		return ReadCel(bytes.NewReader(c.Data), g)
+		return readCel(bytes.NewReader(c.Data), g)
 	}
 	return c
 }
@@ -171,7 +171,7 @@ func (p *Palette) ChunkType() ChunkType {
 	return ChunkTypePalette
 }
 
-func ReadPalette(file io.Reader, g *Gseprite) *Palette {
+func readPalette(file io.Reader, g *Gseprite) *Palette {
 	var p Palette
 	file.Read((*[20]byte)(unsafe.Pointer(&p))[:])
 	for pi := 0; pi < int(p.Size); pi++ {
@@ -180,7 +180,7 @@ func ReadPalette(file io.Reader, g *Gseprite) *Palette {
 		file.Read((*[1]byte)(unsafe.Pointer(&hasName))[:])
 		file.Read((*[4]byte)(unsafe.Pointer(&c))[:])
 		if int(hasName) == 1 {
-			c.Name = ReadString(file)
+			c.Name = readString(file)
 			pi += len(c.Name) + 4
 		}
 
@@ -208,6 +208,7 @@ type Gseprite struct {
 	Palette *Palette
 }
 
+// Get this Aseprite image file Rectangle
 func (g Gseprite) Rect() image.Rectangle {
 	return image.Rectangle{
 		Min: image.Point{X: 0, Y: 0},
@@ -215,6 +216,7 @@ func (g Gseprite) Rect() image.Rectangle {
 	}
 }
 
+// Render frame to single image
 func (f *Frame) Render() image.Image {
 	rect := f.Gseprite.Rect()
 	ret := image.NewNRGBA(rect)
@@ -234,6 +236,7 @@ func (f *Frame) Render() image.Image {
 	return ret
 }
 
+// Create GIF file
 func (g Gseprite) GIF() gif.GIF {
 	var ret gif.GIF
 	for _, frame := range g.Frames {
@@ -274,14 +277,15 @@ func (p *Layer) ChunkType() ChunkType {
 	return ChunkTypeLayer
 }
 
-func ReadLayer(file io.Reader, g *Gseprite) *Layer {
+func readLayer(file io.Reader, g *Gseprite) *Layer {
 	var p Layer
 	file.Read((*[16]byte)(unsafe.Pointer(&p))[:])
-	p.Name = ReadString(file)
+	p.Name = readString(file)
 
 	return &p
 }
 
+// Load Aseprite file
 func LoadAseprite(filename string) (*Gseprite, error) {
 	var g Gseprite
 	if f, err := os.Open(filename); err != nil {
@@ -293,7 +297,7 @@ func LoadAseprite(filename string) (*Gseprite, error) {
 			return nil, errors.New("Magic code check failed")
 		}
 		for i := 0; i < int(g.Header.Frames); i++ {
-			if frame, err := ReadFrame(f, &g); err != nil {
+			if frame, err := readFrame(f, &g); err != nil {
 				return nil, err
 			} else {
 				g.Frames = append(g.Frames, frame)
@@ -324,6 +328,7 @@ const (
 	CelTypeCompressed CelType = 2
 )
 
+// Cel determine where to put a cel in the specified layer/frame
 type Cel struct {
 	LayerIndex uint16
 	X          int16
@@ -361,12 +366,12 @@ func (c *Cel) At(x, y int) color.Color {
 	return c.Image.At(x, y)
 }
 
-func ReadCel(file io.Reader, g *Gseprite) *Cel {
+func readCel(file io.Reader, g *Gseprite) *Cel {
 	var p Cel
 	file.Read((*[16]byte)(unsafe.Pointer(&p))[:])
 	p.ColorDepth = g.Header.ColorDepth
 	switch p.Type {
-	case CelTypeRaw:
+	case CelTypeRaw, CelTypeCompressed:
 		var Height, Width uint16
 		file.Read((*[2]byte)(unsafe.Pointer(&Width))[:])
 		file.Read((*[2]byte)(unsafe.Pointer(&Height))[:])
@@ -374,11 +379,36 @@ func ReadCel(file io.Reader, g *Gseprite) *Cel {
 		p.Image = img
 		switch g.Header.ColorDepth {
 		case 8:
+			img.Pix = make([]byte, Height*Width*4)
 			buffer := make([]byte, Height*Width)
-			file.Read(buffer)
+			r, _ := zlib.NewReader(file)
+			r.Read(buffer)
+			r.Close()
+			img.Stride = int(Width) * 4
+			img.Rect = image.Rectangle{
+				Min: image.Point{X: 0, Y: 0},
+				Max: image.Point{X: int(Width), Y: int(Height)},
+			}
+			for i := 0; i < int(Height*Width); i++ {
+				img.Pix[i*4+3] = buffer[i]
+			}
 		case 16:
+			img.Pix = make([]byte, Height*Width*4)
 			buffer := make([]byte, Height*Width*2)
-			file.Read(buffer)
+			r, _ := zlib.NewReader(file)
+			r.Read(buffer)
+			r.Close()
+			img.Stride = int(Width) * 4
+			img.Rect = image.Rectangle{
+				Min: image.Point{X: 0, Y: 0},
+				Max: image.Point{X: int(Width), Y: int(Height)},
+			}
+			for i := 0; i < int(Height*Width)*2; i += 2 {
+				img.Pix[i*4] = buffer[i*2]
+				img.Pix[i*4+1] = buffer[i*2]
+				img.Pix[i*4+2] = buffer[i*2]
+				img.Pix[i*4+3] = buffer[i*2+1]
+			}
 		case 32:
 			img.Pix = make([]byte, Height*Width*4)
 			r, _ := zlib.NewReader(file)
@@ -391,7 +421,6 @@ func ReadCel(file io.Reader, g *Gseprite) *Cel {
 			}
 		}
 	case CelTypeLinked:
-	case CelTypeCompressed:
 	}
 
 	return &p
