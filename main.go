@@ -206,6 +206,22 @@ type Gseprite struct {
 	Frames  []*Frame
 	Layers  []*Layer
 	Palette *Palette
+
+	// For Sprites render
+	curtime  float64
+	curframe int
+}
+
+// Render current image, param is Duration, should be 1000/FPS
+func (g *Gseprite) SpritesRender(Duration float64) image.Image {
+	g.curtime += Duration
+	if g.curtime > float64(g.Frames[g.curframe].Duration) {
+		g.curtime -= float64(g.Frames[g.curframe].Duration)
+		g.curframe++
+		g.curframe %= len(g.Frames)
+	}
+
+	return g.Frames[g.curframe].Render()
 }
 
 // Get this Aseprite image file Rectangle
