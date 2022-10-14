@@ -6,7 +6,7 @@ A simple program which can read ase file easily.
 
 ## Work with ebiten example
 
-![ebiten example](example.gif)
+![ebiten example](images/example.gif)
 
 ```
 package main
