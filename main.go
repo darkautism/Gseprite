@@ -1,6 +1,7 @@
 package gseprite
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"errors"
@@ -14,15 +15,17 @@ import (
 	"log"
 	"os"
 	"unsafe"
+
+	"github.com/mandykoh/prism/meta/icc"
 )
 
-func readString(file io.Reader) string {
+func readString(file *io.Reader) string {
 	var Size uint16
-	if _, err := file.Read((*[2]byte)(unsafe.Pointer(&Size))[:]); err != nil {
+	if _, err := (*file).Read((*[2]byte)(unsafe.Pointer(&Size))[:]); err != nil {
 		log.Println(err)
 	}
 	buffer := make([]byte, Size)
-	if _, err := file.Read(buffer); err != nil {
+	if _, err := (*file).Read(buffer); err != nil {
 		log.Println(err)
 	}
 	return string(buffer)
@@ -34,17 +37,21 @@ type Header struct {
 	Frames        uint16
 	Width         uint16
 	Height        uint16
-	ColorDepth    uint16
-	Flags         uint32
+	ColorDepth    uint16 // Color depth (bits per pixel) 32 bpp = RGBA 16 bpp = Grayscale 8 bpp = Indexed
+	Flags         uint32 // 1 = Layer opacity has valid value
 	Speed         uint16 // DEPRECATED
 	reserved1     uint32
 	reserved2     uint32
 	Palette       byte
 	ignore        [3]byte
 	NumberOfColor uint16
-	PixelWidth    byte
-	PixelHeight   byte
-	reserved3     [92]byte
+	PixelWidth    byte   // Pixel width (pixel ratio is "pixel width/pixel height"). If this or pixel height field is zero, pixel ratio is 1:1
+	PixelHeight   byte   // Pixel height
+	GridX         int16  // X position of the grid
+	GridY         int16  // Y position of the grid
+	GridWidth     uint16 // Grid width (zero if there is no grid, grid size is 16x16 on Aseprite by default)
+	GridHeight    uint16 // Grid height (zero if there is no grid)
+	reserved3     [84]byte
 }
 
 type Frame struct {
@@ -96,6 +103,7 @@ const (
 	ChunkTypePalette      ChunkType = 0x2019
 	ChunkTypeUserData     ChunkType = 0x2020
 	ChunkTypeSlice        ChunkType = 0x2022
+	ChunkTypeTileset      ChunkType = 0x2023
 )
 
 func (e ChunkType) String() string {
@@ -124,6 +132,8 @@ func (e ChunkType) String() string {
 		return "UserData"
 	case ChunkTypeSlice:
 		return "Slice"
+	case ChunkTypeTileset:
+		return "Tileset"
 	default:
 		return fmt.Sprintf("%d", int(e))
 	}
@@ -155,6 +165,11 @@ func readChunk(file io.Reader, g *Gseprite) Chunk {
 		return readLayer(bytes.NewReader(c.Data), g)
 	case ChunkTypeCel:
 		return readCel(bytes.NewReader(c.Data), g)
+	case ChunkTypeColorProfile:
+		return readColorProfile(bytes.NewReader(c.Data), g)
+
+		// default:
+		// 	log.Panicln("Not support type: ", c.Type)
 	}
 	return c
 }
@@ -174,31 +189,40 @@ func (p *Palette) ChunkType() ChunkType {
 func readPalette(file io.Reader, g *Gseprite) *Palette {
 	var p Palette
 	file.Read((*[20]byte)(unsafe.Pointer(&p))[:])
-	for pi := 0; pi < int(p.Size); pi++ {
-		var hasName uint8
+	for pi := 0; pi < int(p.LastColorIndex)+1; pi++ {
+		var hasName uint16
 		var c NamedColor
-		file.Read((*[1]byte)(unsafe.Pointer(&hasName))[:])
+		file.Read((*[2]byte)(unsafe.Pointer(&hasName))[:])
 		file.Read((*[4]byte)(unsafe.Pointer(&c))[:])
+		log.Println(c)
 		if int(hasName) == 1 {
-			c.Name = readString(file)
-			pi += len(c.Name) + 4
+			c.Name = readString(&file)
 		}
 
 		p.Colors = append(p.Colors, c)
 	}
+	g.Palette = &p
 	return &p
 }
 
 type NamedColor struct {
-	R    int8
-	G    int8
-	B    int8
-	A    int8
+	R    uint8
+	G    uint8
+	B    uint8
+	A    uint8
 	Name string
 }
 
-func (g NamedColor) RGBA() (uint32, uint32, uint32, uint32) {
-	return uint32(g.R), uint32(g.G), uint32(g.B), uint32(g.A)
+func (c NamedColor) RGBA() (r, g, b, a uint32) {
+	r = uint32(c.R)
+	r |= r << 8
+	g = uint32(c.G)
+	g |= g << 8
+	b = uint32(c.B)
+	b |= b << 8
+	a = uint32(c.A)
+	a |= a << 8
+	return
 }
 
 type Gseprite struct {
@@ -236,15 +260,25 @@ func (g Gseprite) Rect() image.Rectangle {
 func (f *Frame) Render() image.Image {
 	rect := f.Gseprite.Rect()
 	ret := image.NewNRGBA(rect)
+NextChunk:
 	for _, c := range f.Chunks {
 		if c.ChunkType() == ChunkTypeCel {
 			var tmp interface{}
 			tmp = c
 			cel := tmp.(*Cel)
 			layer := f.Gseprite.Layers[cel.LayerIndex]
-			if layer.Flags&LayerFlagsVisible == 0 {
+			var lwalker *Layer = layer
+			for lwalker != nil {
+				if lwalker.Flags&LayerFlagsVisible == 0 {
+					continue NextChunk
+				}
+				lwalker = lwalker.parent
+			}
+			if cel.Image == nil {
 				continue
-			} // This layer is unvisible, skip it
+			} // this cel do not contain image
+
+			//fmt.Println("話", cel.Opacity, cel.Y, cel.X, rect, layer.Name)
 
 			draw.Draw(ret, rect, cel, image.Point{X: int(-cel.X), Y: int(-cel.Y)}, draw.Over)
 		}
@@ -277,9 +311,17 @@ const (
 	LayerFlagsReference        LayerFlags = 64
 )
 
+type LayerType uint16
+
+const (
+	LayerTypeNormal  LayerType = 0
+	LayerTypeGroup   LayerType = 1
+	LayerTypeTilemap LayerType = 2
+)
+
 type Layer struct {
 	Flags      LayerFlags
-	Type       uint16
+	Type       LayerType
 	ChildLevel uint16
 	width      uint16 //Ignore
 	height     uint16 //Ignore
@@ -287,6 +329,9 @@ type Layer struct {
 	Opacity    uint8
 	reserved   [3]byte
 	Name       string
+
+	// This field is for fast to know which parent group set unvisable
+	parent *Layer
 }
 
 func (p *Layer) ChunkType() ChunkType {
@@ -296,7 +341,7 @@ func (p *Layer) ChunkType() ChunkType {
 func readLayer(file io.Reader, g *Gseprite) *Layer {
 	var p Layer
 	file.Read((*[16]byte)(unsafe.Pointer(&p))[:])
-	p.Name = readString(file)
+	p.Name = readString(&file)
 
 	return &p
 }
@@ -331,6 +376,29 @@ func LoadAseprite(filename string) (*Gseprite, error) {
 			}
 		}
 
+		// Create layer parent
+		var stack []*Layer = nil
+		var curgroup *Layer
+		for _, l := range g.Layers {
+			for curgroup != nil && l.ChildLevel <= curgroup.ChildLevel {
+				if len(stack) == 0 {
+					curgroup = nil
+				} else {
+					curgroup = stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+				}
+			}
+			if curgroup != nil && l.ChildLevel == curgroup.ChildLevel+1 {
+				l.parent = curgroup
+			}
+			if l.Type == LayerTypeGroup {
+				stack = append(stack, curgroup)
+				curgroup = l
+			}
+			if curgroup != nil && l.ChildLevel > curgroup.ChildLevel+1 {
+				l.parent = curgroup
+			}
+		}
 	}
 
 	return &g, nil
@@ -339,9 +407,10 @@ func LoadAseprite(filename string) (*Gseprite, error) {
 type CelType uint16
 
 const (
-	CelTypeRaw        CelType = 0
-	CelTypeLinked     CelType = 1
-	CelTypeCompressed CelType = 2
+	CelTypeRaw               CelType = 0
+	CelTypeLinked            CelType = 1
+	CelTypeCompressed        CelType = 2
+	CelTypeCompressedTilemap CelType = 3
 )
 
 // Cel determine where to put a cel in the specified layer/frame
@@ -391,6 +460,9 @@ func readCel(file io.Reader, g *Gseprite) *Cel {
 		var Height, Width uint16
 		file.Read((*[2]byte)(unsafe.Pointer(&Width))[:])
 		file.Read((*[2]byte)(unsafe.Pointer(&Height))[:])
+		if Height*Width == 0 {
+			return &p
+		}
 		img := image.NewRGBA(image.Rect(0, 0, int(Height), int(Width)))
 		p.Image = img
 		switch g.Header.ColorDepth {
@@ -400,13 +472,17 @@ func readCel(file io.Reader, g *Gseprite) *Cel {
 			r, _ := zlib.NewReader(file)
 			r.Read(buffer)
 			r.Close()
+
 			img.Stride = int(Width) * 4
 			img.Rect = image.Rectangle{
 				Min: image.Point{X: 0, Y: 0},
 				Max: image.Point{X: int(Width), Y: int(Height)},
 			}
-			for i := 0; i < int(Height*Width); i++ {
-				img.Pix[i*4+3] = buffer[i]
+
+			for y := 0; y < int(Height); y++ {
+				for x := 0; x < int(Width); x++ {
+					img.Set(x, y, g.Palette.Colors[int(buffer[y*int(Width)+x])])
+				}
 			}
 		case 16:
 			img.Pix = make([]byte, Height*Width*4)
@@ -439,5 +515,43 @@ func readCel(file io.Reader, g *Gseprite) *Cel {
 	case CelTypeLinked:
 	}
 
+	return &p
+}
+
+type fixed16_16 int32
+
+func (i fixed16_16) Get() float64 {
+	return float64(i) / 65536.0
+}
+
+type ColorProfile struct {
+	Type  uint16 //0 - no color profile (as in old .aseprite files) 1 - use sRGB 2 - use the embedded ICC profile
+	Flags uint16 //  1 - use special fixed gamma
+	/* FixedGamma: Fixed gamma (1.0 = linear)
+	   Note: The gamma in sRGB is 2.2 in overall but it doesn''t use
+	   this fixed gamma, because sRGB uses different gamma sections
+	   (linear and non-linear). If sRGB is specified with a fixed
+	   gamma = 1.0, it means that this is Linear sRGB.
+	*/
+	FixedGamma fixed16_16
+	reserved   [8]byte
+
+	// If type = ICC:
+	iccprofile *icc.Profile
+}
+
+func (c ColorProfile) ChunkType() ChunkType {
+	return ChunkTypeColorProfile
+}
+
+func readColorProfile(file io.Reader, g *Gseprite) *ColorProfile {
+	var p ColorProfile
+	var err error
+	file.Read((*[16]byte)(unsafe.Pointer(&p))[:])
+	if p.Type == 2 {
+		pf := icc.NewProfileReader(bufio.NewReader(file))
+		p.iccprofile, err = pf.ReadProfile()
+		log.Panicln(err)
+	}
 	return &p
 }
