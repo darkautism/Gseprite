@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/color/palette"
 	"image/draw"
 	"image/gif"
 	"io"
@@ -291,10 +290,20 @@ func (g Gseprite) GIF() gif.GIF {
 	var ret gif.GIF
 	for _, frame := range g.Frames {
 		img := frame.Render()
-		palettedImage := image.NewPaletted(g.Rect(), palette.Plan9)
+
+		var palette color.Palette = color.Palette{
+			image.Transparent,
+		}
+		for _, v := range g.Palette.Colors {
+			palette = append(palette, v)
+		}
+
+		palettedImage := image.NewPaletted(g.Rect(), palette)
 		draw.Draw(palettedImage, palettedImage.Rect, img, g.Rect().Min, draw.Over)
+
 		ret.Image = append(ret.Image, palettedImage)
 		ret.Delay = append(ret.Delay, int(frame.Duration)/10)
+		ret.Disposal = append(ret.Disposal, gif.DisposalPrevious)
 	}
 	return ret
 }
@@ -481,7 +490,12 @@ func readCel(file io.Reader, g *Gseprite) *Cel {
 
 			for y := 0; y < int(Height); y++ {
 				for x := 0; x < int(Width); x++ {
-					img.Set(x, y, g.Palette.Colors[int(buffer[y*int(Width)+x])])
+					pindex := int(buffer[y*int(Width)+x])
+					if pindex == 0 {
+						continue
+					}
+
+					img.Set(x, y, g.Palette.Colors[pindex])
 				}
 			}
 		case 16:
