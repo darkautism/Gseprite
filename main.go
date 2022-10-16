@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
@@ -81,6 +82,7 @@ func readFrame(file io.Reader, g *Gseprite) (*Frame, error) {
 	}
 
 	for i := 0; i < maxChunk; i++ {
+		//log.Printf("chunk %d of %d", i, maxChunk)
 		f.Chunks = append(f.Chunks, readChunk(file, g))
 	}
 
@@ -166,73 +168,31 @@ func readChunk(file io.Reader, g *Gseprite) Chunk {
 		return readCel(bytes.NewReader(c.Data), g)
 	case ChunkTypeColorProfile:
 		return readColorProfile(bytes.NewReader(c.Data), g)
+	case ChunkTypeOldPalette4:
+		return readOldPalette4(bytes.NewReader(c.Data), g)
+	case ChunkTypeFrameTags:
+		return readFrameTags(bytes.NewReader(c.Data), g)
 
-		// default:
-		// 	log.Panicln("Not support type: ", c.Type)
+	default:
+		log.Panicln("Not support type: ", c.Type, "\n", hex.Dump(c.Data))
 	}
 	return c
 }
 
-type Palette struct {
-	Size            uint32
-	FirstColorIndex uint32
-	LastColorIndex  uint32
-	reserved        [8]byte
-	Colors          []color.Color
-}
-
-func (p *Palette) ChunkType() ChunkType {
-	return ChunkTypePalette
-}
-
-func readPalette(file io.Reader, g *Gseprite) *Palette {
-	var p Palette
-	file.Read((*[20]byte)(unsafe.Pointer(&p))[:])
-	for pi := 0; pi < int(p.LastColorIndex)+1; pi++ {
-		var hasName uint16
-		var c NamedColor
-		file.Read((*[2]byte)(unsafe.Pointer(&hasName))[:])
-		file.Read((*[4]byte)(unsafe.Pointer(&c))[:])
-		log.Println(c)
-		if int(hasName) == 1 {
-			c.Name = readString(&file)
-		}
-
-		p.Colors = append(p.Colors, c)
-	}
-	g.Palette = &p
-	return &p
-}
-
-type NamedColor struct {
-	R    uint8
-	G    uint8
-	B    uint8
-	A    uint8
-	Name string
-}
-
-func (c NamedColor) RGBA() (r, g, b, a uint32) {
-	r = uint32(c.R)
-	r |= r << 8
-	g = uint32(c.G)
-	g |= g << 8
-	b = uint32(c.B)
-	b |= b << 8
-	a = uint32(c.A)
-	a |= a << 8
-	return
-}
-
 type Gseprite struct {
-	Header  Header
-	Frames  []*Frame
-	Layers  []*Layer
-	Palette *Palette
+	Header    Header
+	Frames    []*Frame
+	Layers    []*Layer
+	Palette   *Palette
+	FrameTags *FrameTags
 
 	// For Sprites render
 	curtime  float64
 	curframe int
+	// For Tag Render
+	prevTag      string
+	tag_curtime  float64
+	tag_curframe uint16
 }
 
 // Render current image, param is Duration, should be 1000/FPS
@@ -245,6 +205,29 @@ func (g *Gseprite) SpritesRender(Duration float64) image.Image {
 	}
 
 	return g.Frames[g.curframe].Render()
+}
+
+// Render current image by tag, param is Duration, should be 1000/FPS
+func (g *Gseprite) SpritesTagRender(tagname string, Duration float64) (image.Image, error) {
+	tag, ok := g.FrameTags.M[tagname]
+	if !ok {
+		return nil, NoFound
+	}
+	if g.prevTag != tagname {
+		g.prevTag = tagname
+		g.tag_curframe = 0
+		g.tag_curtime = 0
+	}
+
+	g.curtime += Duration
+	if g.curtime > float64(g.Frames[int(tag.From+g.tag_curframe)].Duration) {
+		g.curtime -= float64(g.Frames[int(tag.From+g.tag_curframe)].Duration)
+		g.tag_curframe++
+		g.tag_curframe %= tag.To - tag.From + 1
+	}
+
+	log.Println("Render", g.tag_curframe)
+	return g.Frames[int(tag.From+g.tag_curframe)].Render(), nil
 }
 
 // Get this Aseprite image file Rectangle
@@ -276,6 +259,7 @@ NextChunk:
 			if cel.Image == nil {
 				continue
 			} // this cel do not contain image
+			// TODO: Should check Blend mode
 
 			//fmt.Println("話", cel.Opacity, cel.Y, cel.X, rect, layer.Name)
 
